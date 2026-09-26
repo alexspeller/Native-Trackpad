@@ -150,6 +150,27 @@ void zoomToFit() {
 }
 
 /**
+ * Fusion's main window is titled "<document name> - Autodesk Fusion ..." these days,
+ * so look for the name anywhere in the title (it used to be a prefix).
+ */
+bool isFusionWindow(NSEvent* event) {
+    NSString* title = event.window.title;
+    return title != nil && [title rangeOfString:@"Autodesk Fusion"].location != NSNotFound;
+}
+
+/**
+ * Only the modifier keys we care about (ignores Caps Lock, Fn, device-dependent bits).
+ */
+NSEventModifierFlags modifiers(NSEvent* event) {
+    return event.modifierFlags & (NSEventModifierFlagShift | NSEventModifierFlagControl |
+                                  NSEventModifierFlagOption | NSEventModifierFlagCommand);
+}
+
+bool magnifyActive = false;
+bool scrollActive = false;
+NSTimeInterval lastScrollTime = 0;
+
+/**
  * This function determines how we handle every event in app
  * Returns:
  * 0 = no change
@@ -162,63 +183,108 @@ void zoomToFit() {
 int howWeShouldHandleEvent(NSEvent* event) {
     // TODO handle only events to QTCanvas
 
+    if (!app || !app->activeViewport() || !isFusionWindow(event)) {
+        return 0;
+    }
+
+    NSEventModifierFlags mods = modifiers(event);
+    bool onlyShiftOrNone = (mods & ~NSEventModifierFlagShift) == 0;
+
     if (event.type == NSEventTypeGesture) {
-        if ((event.modifierFlags != 0 && ((event.modifierFlags & NSEventModifierFlagShift) == 0)) || !app->activeViewport() || ![event.window.title hasPrefix: @"Autodesk Fusion"]) {
-            return 0;
-        }
-        return 1;
+        return onlyShiftOrNone ? 1 : 0;
     }
     if (event.type == NSEventTypeScrollWheel) {
-        if ((event.modifierFlags != 0 && ((event.modifierFlags & NSEventModifierFlagShift) == 0)) || !app->activeViewport() || ![event.window.title hasPrefix: @"Autodesk Fusion"]) {
+        // Trackpad / Magic Mouse only; a notched mouse wheel keeps Fusion's own zoom.
+        if (!onlyShiftOrNone || !event.hasPreciseScrollingDeltas) {
             return 0;
         }
-        return event.modifierFlags & NSEventModifierFlagShift ? 5 : 2;
+        int move = (mods & NSEventModifierFlagShift) ? 5 : 2;
+
+        // Some scroll events arrive late and out of order (e.g. a gesture's Ended, or
+        // one of its Changed events, only turns up with the next pointer movement).
+        // Acting on those makes the view jump after the gesture is over, so drop
+        // anything older than the newest scroll event already seen.
+        if (event.timestamp + 0.0005 < lastScrollTime) {
+            return 1;
+        }
+        lastScrollTime = event.timestamp;
+
+        if (event.momentumPhase != NSEventPhaseNone) {
+            // Flick-to-glide keeps panning, but the fingers are off the trackpad now.
+            if (event.momentumPhase & NSEventPhaseBegan) {
+                scrollActive = false;
+            }
+            return move;
+        }
+        if (event.phase & (NSEventPhaseBegan | NSEventPhaseMayBegin)) {
+            scrollActive = true;
+            return move;
+        }
+        if (event.phase & (NSEventPhaseEnded | NSEventPhaseCancelled)) {
+            scrollActive = false;
+            return move;
+        }
+        if (event.phase == NSEventPhaseNone) {
+            return move;
+        }
+        // Changed: only while the fingers are scrolling, strays are dropped.
+        return scrollActive ? move : 1;
     }
     if (event.type == NSEventTypeMagnify) {
-        if (event.modifierFlags != 0 || !app->activeViewport() || ![event.window.title hasPrefix: @"Autodesk Fusion"]) {
+        if (mods != 0) {
             return 0;
         }
-        return 3;
+        // Stray Changed events can turn up after the pinch has Ended (with the next
+        // pointer movement), so only zoom between Began and Ended/Cancelled.
+        if (event.phase & NSEventPhaseBegan) {
+            magnifyActive = true;
+            return 3;
+        }
+        if (event.phase & (NSEventPhaseEnded | NSEventPhaseCancelled)) {
+            magnifyActive = false;
+            return 1;
+        }
+        if (event.phase == NSEventPhaseNone) {
+            return 3;
+        }
+        return magnifyActive ? 3 : 1;
     }
     if (event.type == NSEventTypeSmartMagnify) {
-        if (event.modifierFlags != 0 || !app->activeViewport() || ![event.window.title hasPrefix: @"Autodesk Fusion"]) {
-            return 0;
-        }
-        return 4;
+        return mods == 0 ? 4 : 0;
     }
 
     return 0;
 }
 
+/**
+ * Returns the event to let Fusion handle it, or nil when we handled/discarded it.
+ */
+NSEvent* handleEvent(NSEvent* event) {
+    int result = 0;
+    try {
+        result = howWeShouldHandleEvent(event);
+        if (result == 2) {
+            pan(event.scrollingDeltaX, event.scrollingDeltaY);
+        } else if (result == 3) {
+            zoom(event.magnification);
+        } else if (result == 4) {
+            zoomToFit();
+        } else if (result == 5) {
+            orbit(event.scrollingDeltaX, event.scrollingDeltaY);
+        }
+    } catch (...) {
+        // never swallow an event because of an error on our side
+        result = 0;
+    }
+    return result == 0 ? event : nil;
+}
 
 /**
- * Method swizzling here
+ * We used to swizzle -[NSApplication sendEvent:], but Fusion now exchanges sendEvent:
+ * with its own hook (NuBase10.dylib) and can swap it again later, which silently
+ * undoes any other swizzle. A local event monitor is not affected by that.
  */
-@implementation NSApplication (Tracking)
-- (void)mySendEvent2:(NSEvent *)event {
-    int result = howWeShouldHandleEvent(event);
-    if (result == 0) {
-        [self mySendEvent2:event];
-    } else if(result == 1) {
-        // noop
-    } else if(result == 2) {
-        pan(event.scrollingDeltaX, event.scrollingDeltaY);
-    } else if(result == 3) {
-        zoom(event.magnification);
-    } else if(result == 4) {
-        zoomToFit();
-    } else if(result == 5) {
-      orbit(event.scrollingDeltaX, event.scrollingDeltaY);
-    }
-}
-
-- (void)nativeTrackpad {
-    Method original = class_getInstanceMethod([self class], @selector(sendEvent:));
-    Method swizzled = class_getInstanceMethod([self class], @selector(mySendEvent2:));
-
-    method_exchangeImplementations(original, swizzled);
-}
-@end
+id eventMonitor = nil;
 
 /**
  * Main entry here
@@ -230,23 +296,26 @@ extern "C" XI_EXPORT bool run(const char* context) {
     ui = app->userInterface();
     if (!ui) { return false; }
 
-    [NSApplication.sharedApplication nativeTrackpad];
+    if (eventMonitor == nil) {
+        NSEventMask mask = NSEventMaskScrollWheel | NSEventMaskMagnify |
+                           NSEventMaskSmartMagnify | NSEventMaskGesture;
+        eventMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:mask
+                                                             handler:^NSEvent* (NSEvent* event) {
+            return handleEvent(event);
+        }];
+    }
 
-    return true;
+    return eventMonitor != nil;
 }
 
 /**
  * Stop overriding events
  */
 extern "C" XI_EXPORT bool stop(const char* context) {
-    // this is the same as run since we just need to swap the sendEvent implementations back
-    app = Application::get();
-    if (!app) { return false; }
-
-    ui = app->userInterface();
-    if (!ui) { return false; }
-
-    [NSApplication.sharedApplication nativeTrackpad];
+    if (eventMonitor != nil) {
+        [NSEvent removeMonitor:eventMonitor];
+        eventMonitor = nil;
+    }
 
     return true;
 }
