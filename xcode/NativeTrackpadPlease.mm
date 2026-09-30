@@ -8,7 +8,10 @@
 #import <objc/runtime.h>
 
 #include <dlfcn.h>
+#include <cmath>
 #include <cstring>
+#include <deque>
+#include <utility>
 
 using namespace adsk::core;
 using namespace adsk::fusion;
@@ -153,6 +156,107 @@ void zoomToFit() {
 }
 
 /**
+ * Pinch inertia. macOS sends momentum events after a flicked scroll but not after a pinch,
+ * so we glide on ourselves: the zoom speed at release decays exponentially, like a scroll's.
+ */
+const NSTimeInterval kPinchSpeedWindow = 0.08;        // s of pinch before release that set the glide speed
+const NSTimeInterval kPinchGlideTimeConstant = 0.25;  // s; the glide speed falls to 1/e in this time
+const double kPinchGlideMinStartSpeed = 0.3;          // magnification/s; slower releases don't glide
+const double kPinchGlideStopSpeed = 0.02;             // magnification/s
+const NSTimeInterval kPinchGlideFrame = 1.0 / 60;
+
+std::deque<std::pair<NSTimeInterval, double>> pinchSamples;  // (timestamp, magnification)
+NSTimer* pinchGlideTimer = nil;
+double pinchGlideSpeed = 0;  // magnification/s
+NSTimeInterval pinchGlideLastTime = 0;
+
+void stopPinchGlide() {
+    [pinchGlideTimer invalidate];
+    pinchGlideTimer = nil;
+    pinchGlideSpeed = 0;
+}
+
+void recordPinchSample(NSEvent* event) {
+    if (event.phase & NSEventPhaseBegan) {
+        pinchSamples.clear();
+    }
+    pinchSamples.emplace_back(event.timestamp, event.magnification);
+    while (pinchSamples.front().first < event.timestamp - kPinchSpeedWindow) {
+        pinchSamples.pop_front();
+    }
+}
+
+void pinchGlideStep() {
+    // NSEvent timestamps and systemUptime are the same clock.
+    NSTimeInterval now = [NSProcessInfo processInfo].systemUptime;
+    double decay = exp(-(now - pinchGlideLastTime) / kPinchGlideTimeConstant);
+    // exactly how far the decaying speed travels since the last step, whatever the frame rate
+    double step = pinchGlideSpeed * kPinchGlideTimeConstant * (1 - decay);
+    pinchGlideSpeed *= decay;
+    pinchGlideLastTime = now;
+    try {
+        if (!app || !app->activeViewport()) {
+            stopPinchGlide();
+            return;
+        }
+        zoom(step);
+    } catch (...) {
+        stopPinchGlide();
+        return;
+    }
+    if (fabs(pinchGlideSpeed) < kPinchGlideStopSpeed) {
+        stopPinchGlide();
+    }
+}
+
+void startPinchGlide(NSTimeInterval endTime) {
+    stopPinchGlide();
+    double magnification = 0;
+    for (const auto& sample : pinchSamples) {
+        if (sample.first > endTime - kPinchSpeedWindow) {
+            magnification += sample.second;
+        }
+    }
+    pinchSamples.clear();
+    // An Ended that turns up late (with the next pointer movement) glides only as fast as
+    // it would be going by now, which is usually not at all.
+    NSTimeInterval now = [NSProcessInfo processInfo].systemUptime;
+    double speed = magnification / kPinchSpeedWindow * exp(-fmax(0, now - endTime) / kPinchGlideTimeConstant);
+    if (fabs(speed) < kPinchGlideMinStartSpeed) {
+        return;
+    }
+    pinchGlideSpeed = speed;
+    pinchGlideLastTime = now;
+    pinchGlideTimer = [NSTimer timerWithTimeInterval:kPinchGlideFrame repeats:YES block:^(NSTimer* timer) {
+        pinchGlideStep();
+    }];
+    // common modes, so it keeps going while a menu or a drag has the run loop
+    [[NSRunLoop mainRunLoop] addTimer:pinchGlideTimer forMode:NSRunLoopCommonModes];
+}
+
+/**
+ * Touching the trackpad, clicking or starting another gesture stops a glide.
+ */
+bool stopsPinchGlide(NSEvent* event) {
+    switch (event.type) {
+        case NSEventTypeLeftMouseDown:
+        case NSEventTypeRightMouseDown:
+        case NSEventTypeOtherMouseDown:
+        case NSEventTypeSmartMagnify:
+            return true;
+        case NSEventTypeMouseMoved:
+            return event.deltaX != 0 || event.deltaY != 0;
+        case NSEventTypeMagnify:
+            return (event.phase & NSEventPhaseBegan) != 0;
+        case NSEventTypeScrollWheel:
+            return (event.phase & (NSEventPhaseBegan | NSEventPhaseMayBegin)) != 0 ||
+                   (event.phase == NSEventPhaseNone && event.momentumPhase == NSEventPhaseNone);
+        default:
+            return false;
+    }
+}
+
+/**
  * Fusion's main window is titled "<document name> - Autodesk Fusion ..." these days,
  * so look for the name anywhere in the title (it used to be a prefix).
  */
@@ -228,6 +332,7 @@ bool magnifyOnCanvas = false;
  * 3 = zoom
  * 4 = zoom to fit
  * 5 = orbit
+ * 6 = pinch released, glide on
  */
 int howWeShouldHandleEvent(NSEvent* event) {
     if (!app || !app->activeViewport()) {
@@ -303,8 +408,9 @@ int howWeShouldHandleEvent(NSEvent* event) {
             return 3;
         }
         if (event.phase & (NSEventPhaseEnded | NSEventPhaseCancelled)) {
+            bool glide = magnifyActive && (event.phase & NSEventPhaseEnded);
             magnifyActive = false;
-            return 1;
+            return glide ? 6 : 1;
         }
         if (event.phase == NSEventPhaseNone) {
             return 3;
@@ -321,7 +427,21 @@ int howWeShouldHandleEvent(NSEvent* event) {
 /**
  * Returns the event to let Fusion handle it, or nil when we handled/discarded it.
  */
+/**
+ * The gestures we act on. Clicks and pointer moves are also watched, but only to stop a glide.
+ */
+const NSEventMask kGestureMask = NSEventMaskScrollWheel | NSEventMaskMagnify |
+                                 NSEventMaskSmartMagnify | NSEventMaskGesture;
+const NSEventMask kStopGlideMask = NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown |
+                                   NSEventMaskOtherMouseDown | NSEventMaskMouseMoved;
+
 NSEvent* handleEvent(NSEvent* event) {
+    if (pinchGlideTimer != nil && stopsPinchGlide(event)) {
+        stopPinchGlide();
+    }
+    if ((NSEventMaskFromType(event.type) & kGestureMask) == 0) {
+        return event;
+    }
     int result = 0;
     try {
         result = howWeShouldHandleEvent(event);
@@ -329,6 +449,12 @@ NSEvent* handleEvent(NSEvent* event) {
             pan(event.scrollingDeltaX, event.scrollingDeltaY);
         } else if (result == 3) {
             zoom(event.magnification);
+            if (event.phase != NSEventPhaseNone) {
+                recordPinchSample(event);
+            }
+        } else if (result == 6) {
+            recordPinchSample(event);
+            startPinchGlide(event.timestamp);
         } else if (result == 4) {
             zoomToFit();
         } else if (result == 5) {
@@ -362,9 +488,7 @@ extern "C" XI_EXPORT bool run(const char* context) {
     qMetaObjectClassName = (QMetaObjectClassNameFn)dlsym(RTLD_DEFAULT, "_ZNK11QMetaObject9classNameEv");
 
     if (eventMonitor == nil) {
-        NSEventMask mask = NSEventMaskScrollWheel | NSEventMaskMagnify |
-                           NSEventMaskSmartMagnify | NSEventMaskGesture;
-        eventMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:mask
+        eventMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:kGestureMask | kStopGlideMask
                                                              handler:^NSEvent* (NSEvent* event) {
             return handleEvent(event);
         }];
@@ -377,6 +501,7 @@ extern "C" XI_EXPORT bool run(const char* context) {
  * Stop overriding events
  */
 extern "C" XI_EXPORT bool stop(const char* context) {
+    stopPinchGlide();
     if (eventMonitor != nil) {
         [NSEvent removeMonitor:eventMonitor];
         eventMonitor = nil;
