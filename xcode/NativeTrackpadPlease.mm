@@ -7,6 +7,9 @@
 
 #import <objc/runtime.h>
 
+#include <dlfcn.h>
+#include <cstring>
+
 using namespace adsk::core;
 using namespace adsk::fusion;
 using namespace adsk::cam;
@@ -159,6 +162,49 @@ bool isFusionWindow(NSEvent* event) {
 }
 
 /**
+ * Fusion's UI is Qt. The 3D view is a QTCanvas widget with an NSView of its own, while the
+ * data panel, timeline and toolbars are drawn into other views of the same window.
+ * Qt's exported QWidget::find() maps an NSView to its widget; the widget's class name comes
+ * from its QMetaObject (metaObject() is the first virtual function of every QObject).
+ */
+typedef void* (*QWidgetFindFn)(unsigned long long);            // static QWidget* QWidget::find(WId)
+typedef const char* (*QMetaObjectClassNameFn)(const void*);    // const char* QMetaObject::className() const
+typedef const void* (*QObjectMetaObjectFn)(const void*);       // virtual const QMetaObject* QObject::metaObject() const
+
+QWidgetFindFn qWidgetFind = nullptr;
+QMetaObjectClassNameFn qMetaObjectClassName = nullptr;
+
+bool isCanvasView(NSView* view) {
+    if (view == nil) {
+        return false;
+    }
+    void* widget = qWidgetFind((unsigned long long)(uintptr_t)(__bridge void*)view);
+    if (widget == nullptr) {
+        return false;
+    }
+    QObjectMetaObjectFn metaObject = (QObjectMetaObjectFn)(*(void* const* const*)widget)[0];
+    const char* className = qMetaObjectClassName(metaObject(widget));
+    return className != nullptr && strcmp(className, "QTCanvas") == 0;
+}
+
+/**
+ * Is the pointer over the 3D view (and not the data panel, timeline, a toolbar, ...)?
+ */
+bool isOverCanvas(NSEvent* event) {
+    NSWindow* window = event.window;
+    if (window == nil) {
+        return false;
+    }
+    if (qWidgetFind == nullptr || qMetaObjectClassName == nullptr) {
+        // No Qt to ask, so treat the whole main window as the 3D view.
+        return isFusionWindow(event);
+    }
+    // The frame view has no superview, so it takes the point in window coordinates.
+    NSView* frameView = window.contentView.superview ?: window.contentView;
+    return isCanvasView([frameView hitTest:event.locationInWindow]);
+}
+
+/**
  * Only the modifier keys we care about (ignores Caps Lock, Fn, device-dependent bits).
  */
 NSEventModifierFlags modifiers(NSEvent* event) {
@@ -169,6 +215,9 @@ NSEventModifierFlags modifiers(NSEvent* event) {
 bool magnifyActive = false;
 bool scrollActive = false;
 NSTimeInterval lastScrollTime = 0;
+// Where the current scroll / pinch started: the rest of it (and its momentum) goes the same way.
+bool scrollOnCanvas = false;
+bool magnifyOnCanvas = false;
 
 /**
  * This function determines how we handle every event in app
@@ -181,9 +230,7 @@ NSTimeInterval lastScrollTime = 0;
  * 5 = orbit
  */
 int howWeShouldHandleEvent(NSEvent* event) {
-    // TODO handle only events to QTCanvas
-
-    if (!app || !app->activeViewport() || !isFusionWindow(event)) {
+    if (!app || !app->activeViewport()) {
         return 0;
     }
 
@@ -191,11 +238,20 @@ int howWeShouldHandleEvent(NSEvent* event) {
     bool onlyShiftOrNone = (mods & ~NSEventModifierFlagShift) == 0;
 
     if (event.type == NSEventTypeGesture) {
-        return onlyShiftOrNone ? 1 : 0;
+        return onlyShiftOrNone && isOverCanvas(event) ? 1 : 0;
     }
     if (event.type == NSEventTypeScrollWheel) {
         // Trackpad / Magic Mouse only; a notched mouse wheel keeps Fusion's own zoom.
         if (!onlyShiftOrNone || !event.hasPreciseScrollingDeltas) {
+            return 0;
+        }
+        // Scrolls that start anywhere but the 3D view (data panel, timeline, ...) are Fusion's.
+        bool starts = (event.phase & (NSEventPhaseBegan | NSEventPhaseMayBegin)) != 0;
+        bool unphased = event.phase == NSEventPhaseNone && event.momentumPhase == NSEventPhaseNone;
+        if (starts || unphased) {
+            scrollOnCanvas = isOverCanvas(event);
+        }
+        if (!scrollOnCanvas) {
             return 0;
         }
         int move = (mods & NSEventModifierFlagShift) ? 5 : 2;
@@ -234,6 +290,12 @@ int howWeShouldHandleEvent(NSEvent* event) {
         if (mods != 0) {
             return 0;
         }
+        if ((event.phase & NSEventPhaseBegan) || event.phase == NSEventPhaseNone) {
+            magnifyOnCanvas = isOverCanvas(event);
+        }
+        if (!magnifyOnCanvas) {
+            return 0;
+        }
         // Stray Changed events can turn up after the pinch has Ended (with the next
         // pointer movement), so only zoom between Began and Ended/Cancelled.
         if (event.phase & NSEventPhaseBegan) {
@@ -250,7 +312,7 @@ int howWeShouldHandleEvent(NSEvent* event) {
         return magnifyActive ? 3 : 1;
     }
     if (event.type == NSEventTypeSmartMagnify) {
-        return mods == 0 ? 4 : 0;
+        return mods == 0 && isOverCanvas(event) ? 4 : 0;
     }
 
     return 0;
@@ -295,6 +357,9 @@ extern "C" XI_EXPORT bool run(const char* context) {
 
     ui = app->userInterface();
     if (!ui) { return false; }
+
+    qWidgetFind = (QWidgetFindFn)dlsym(RTLD_DEFAULT, "_ZN7QWidget4findEy");
+    qMetaObjectClassName = (QMetaObjectClassNameFn)dlsym(RTLD_DEFAULT, "_ZNK11QMetaObject9classNameEv");
 
     if (eventMonitor == nil) {
         NSEventMask mask = NSEventMaskScrollWheel | NSEventMaskMagnify |
