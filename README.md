@@ -17,15 +17,13 @@ Add-In for Autodesk Fusion 360.
 
 - In Fusion settings make sure to **turn off** `Use gesture-based view navigation`!  
   And restart the application.
-- You can't no longer scroll in Data panel and other few places!  
-  If you are stuck scrolling hold Command key!
 - Perspective camera can be very slow in certain situations!  
   Orthographic camera fixes that!
 - [Common issues](https://github.com/luclefleur/Native-Trackpad/issues)!
 
 ## Install
 
-- [Download](https://github.com/alexspeller/Native-Trackpad/releases/download/0.17-alexspeller/NativeTrackpadPlease.zip) & unzip.
+- [Download](https://github.com/alexspeller/Native-Trackpad/releases/download/0.18-alexspeller/NativeTrackpadPlease.zip) & unzip.
 - Go to: Tools → Add-ins → Add-ins → Click ➕.
 - Select unzipped folder.
 
